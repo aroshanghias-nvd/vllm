@@ -8,6 +8,7 @@
 # --------------------------------------------------------
 
 import math
+import os
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from functools import cached_property
@@ -375,10 +376,22 @@ class NanoNemotronVLMultiModalProcessor(
         return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
 
     def _get_image_fields_config(self, hf_inputs: BatchFeature):
-        if self.info.is_dynamic_tiler:
+        dynamic_tiler = getattr(
+            self,
+            "is_dynamic_tiler",
+            getattr(
+                self.info,
+                "is_dynamic_tiler",
+                getattr(self, "dynamic_resolution", False),
+            ),
+        )
+        if dynamic_tiler and "num_tokens_per_image" in hf_inputs:
             pixel_values_flat = MultiModalFieldConfig.batched("image")
         else:
             image_num_patches = hf_inputs.get("image_num_patches", torch.empty(0))
+            # Static video-as-images uses zero patch counts for secondary frame
+            # placeholders; flat_from_sizes groups each primary frame with its
+            # temporal partner and gives secondary placeholders an empty slice.
             pixel_values_flat = MultiModalFieldConfig.flat_from_sizes(
                 "image", image_num_patches
             )
@@ -435,6 +448,16 @@ class NanoNemotronVLMultiModalProcessor(
         hf_processor: NanoNemotronVLProcessor,
         out_mm_data: BatchedTensorInputs,
     ):
+        def get_mm_item_value(name: str, item_idx: int) -> object | None:
+            values = out_mm_data.get(name)
+            if values is None:
+                return None
+            if torch.is_tensor(values):
+                if values.ndim == 0:
+                    return values
+                return values[item_idx]
+            return values[item_idx]
+
         if "image_num_patches" in out_mm_data:
             image_num_patches = out_mm_data["image_num_patches"]
             assert isinstance(image_num_patches, torch.Tensor)
@@ -452,8 +475,43 @@ class NanoNemotronVLMultiModalProcessor(
 
             if isinstance(images, ImageEmbeddingItems):
                 feature_size = images.get_feature_size(item_idx)
-            elif self.info.is_dynamic_tiler:
+            elif "num_tokens_per_image" in out_mm_data:
                 feature_size = out_mm_data["num_tokens_per_image"][item_idx]
+            elif "image_num_patches" in out_mm_data or "num_patches" in out_mm_data:
+                patch_count = get_mm_item_value("image_num_patches", item_idx)
+                if patch_count is None:
+                    patch_count = get_mm_item_value("num_patches", item_idx)
+                assert patch_count is not None
+                if torch.is_tensor(patch_count):
+                    patch_count = int(patch_count.item())
+                else:
+                    patch_count = int(patch_count)
+
+                if patch_count == 0:
+                    feature_size = 0
+                elif "imgs_sizes" in out_mm_data:
+                    imgs_size = get_mm_item_value("imgs_sizes", item_idx)
+                    assert imgs_size is not None
+                    target_h, target_w = imgs_size
+                    patch_size = int(getattr(hf_processor.config, "patch_size", 16))
+                    downsample_ratio = float(
+                        getattr(hf_processor.config, "downsample_ratio", 0.5)
+                    )
+                    feature_size = int(
+                        (int(target_h) // patch_size)
+                        * downsample_ratio
+                        * (int(target_w) // patch_size)
+                        * downsample_ratio
+                    )
+                else:
+                    image_size = images.get_image_size(item_idx)
+                    max_num_tiles = hf_processor.max_num_tiles
+                    tokens_per_patch = hf_processor.get_num_image_tokens(
+                        image_width=image_size.width,
+                        image_height=image_size.height,
+                        max_num_tiles=max_num_tiles,
+                    )
+                    feature_size = int(patch_count * tokens_per_patch)
             else:
                 image_size = images.get_image_size(item_idx)
                 max_num_tiles = hf_processor.max_num_tiles
@@ -471,6 +529,11 @@ class NanoNemotronVLMultiModalProcessor(
                 local_image_num_patches
             ):
                 num_patches = int(local_image_num_patches[item_idx])
+
+            if torch.is_tensor(feature_size):
+                feature_size = int(feature_size.item())
+            else:
+                feature_size = int(feature_size)
 
             return hf_processor.get_image_repl(feature_size, num_patches)
 
@@ -1115,19 +1178,30 @@ class NemotronH_Nano_VL_V2(
         if pixel_values_flat is None:
             return None
 
-        if self.dynamic_resolution:
-            pixel_values_flat = DynamicResolutionImageTiler.stack(
-                pixel_values_flat, self.patch_size
-            )
+        has_dynamic = "imgs_sizes" in kwargs and "num_tokens_per_image" in kwargs
+        has_static = "image_num_patches" in kwargs
+        if has_dynamic:
+            if not torch.is_tensor(pixel_values_flat) or pixel_values_flat.ndim == 4:
+                pixel_values_flat = DynamicResolutionImageTiler.stack(
+                    pixel_values_flat, self.patch_size
+                )
             return NanoNemotronVLImagePixelInputsDynamic(
                 pixel_values_flat=pixel_values_flat, **kwargs
             )
-        else:
-            return NanoNemotronVLImagePixelInputs(
-                pixel_values_flat=pixel_values_flat,
-                num_patches=kwargs.pop("image_num_patches"),
-                **kwargs,
+
+        if not has_static:
+            raise ValueError(
+                "Expected either dynamic image keys "
+                "(imgs_sizes, num_tokens_per_image) or static image_num_patches, "
+                f"got keys={sorted(kwargs.keys())}"
             )
+
+        kwargs.pop("imgs_sizes", None)
+        return NanoNemotronVLImagePixelInputs(
+            pixel_values_flat=pixel_values_flat,
+            num_patches=kwargs.pop("image_num_patches"),
+            **kwargs,
+        )
 
     def _process_image_input_dynamic(
         self, image_input: NanoNemotronVLImagePixelInputsDynamic
@@ -1146,17 +1220,115 @@ class NemotronH_Nano_VL_V2(
     def _process_image_input(
         self, image_input: NanoNemotronVLImagePixelInputs
     ) -> tuple[torch.Tensor, ...]:
-        image_embeds = self.extract_feature(image_input["pixel_values_flat"])
+        pixel_values = image_input["pixel_values_flat"]
         num_patches = image_input["num_patches"]
+        hidden_size = self.config.text_config.hidden_size
+        temporal_patch_size = self.video_temporal_patch_size
+
+        if (
+            temporal_patch_size > 1
+            and num_patches.numel() > 0
+            and ((num_patches == 0).any() or (num_patches == temporal_patch_size).all())
+        ):
+            if not torch.is_tensor(pixel_values):
+                flattened_pixels: list[torch.Tensor] = []
+
+                def append_pixels(item: object) -> None:
+                    if torch.is_tensor(item):
+                        if item.numel() == 0:
+                            return
+                        flattened_pixels.append(
+                            item if item.ndim == 4 else item.unsqueeze(0)
+                        )
+                        return
+                    if isinstance(item, (list, tuple)):
+                        for child in item:
+                            append_pixels(child)
+                        return
+                    raise TypeError(
+                        "Expected tensor or nested tensor list for "
+                        f"pixel_values_flat, got {type(item)}"
+                    )
+
+                append_pixels(pixel_values)
+                if not flattened_pixels:
+                    device = num_patches.device
+                    pixel_values = torch.empty(
+                        0, 3, 0, 0, device=device, dtype=torch.bfloat16
+                    )
+                else:
+                    pixel_values = torch.cat(flattened_pixels, dim=0)
+
+            total_requested_frames = int(num_patches.sum().item())
+            available_frames = int(pixel_values.shape[0])
+            if available_frames < total_requested_frames:
+                raise ValueError(
+                    "Static video-as-images received too few frame tensors for "
+                    "temporal tubelets: "
+                    f"available={available_frames}, requested={total_requested_frames}, "
+                    f"num_patches={num_patches.tolist()}. "
+                    "Check that pixel_values_flat uses flat_from_sizes with "
+                    "image_num_patches."
+                )
+
+            if os.environ.get("NRL_DEBUG", "0") == "1":
+                print(
+                    "[VLLM_VIDEO_AS_IMAGES_EMBED] "
+                    f"items={num_patches.numel()} "
+                    f"available_frames={available_frames} "
+                    f"requested_frames={total_requested_frames} "
+                    f"num_patches_head={num_patches[:8].tolist()}",
+                    flush=True,
+                )
+
+            nonzero_items = int((num_patches > 0).sum().item())
+            video_embeds = self.extract_feature(
+                pixel_values[:total_requested_frames],
+                num_frames=total_requested_frames,
+            ).view(-1, hidden_size)
+            if nonzero_items == 0:
+                feature_size = 0
+            elif video_embeds.shape[0] % nonzero_items != 0:
+                raise ValueError(
+                    "Static video-as-images produced an embedding count that "
+                    "cannot be split across temporal tubelets: "
+                    f"embeds={video_embeds.shape[0]}, items={nonzero_items}, "
+                    f"num_patches={num_patches.tolist()}"
+                )
+            else:
+                feature_size = video_embeds.shape[0] // nonzero_items
+
+            results: list[torch.Tensor] = []
+            embed_offset = 0
+            for patch_count_tensor in num_patches:
+                patch_count = int(patch_count_tensor.item())
+                if patch_count == 0:
+                    results.append(
+                        torch.empty(
+                            0,
+                            hidden_size,
+                            device=pixel_values.device,
+                            dtype=torch.bfloat16,
+                        )
+                    )
+                    continue
+
+                item_embeds = video_embeds[embed_offset : embed_offset + feature_size]
+                embed_offset += feature_size
+                results.append(item_embeds)
+
+            return tuple(results)
+
+        image_embeds = self.extract_feature(pixel_values)
 
         # Only one image in the current batch
         if len(num_patches) == 1:
-            return (image_embeds.view(-1, self.config.text_config.hidden_size),)
+            return (image_embeds.view(-1, hidden_size),)
 
         # NOTE: Image embeddings are split into separate tensors for each image
         # by the size of each embedding.
         feature_size = image_embeds.shape[1]
-        image_embeds = image_embeds.view(-1, self.config.text_config.hidden_size)
+        image_embeds = image_embeds.view(-1, hidden_size)
         image_feature_sizes = [
             num_patches * feature_size for num_patches in num_patches
         ]
@@ -1444,10 +1616,10 @@ class NemotronH_Nano_VL_V2(
                 image_input = modalities["images"]
                 if image_input["type"] == "image_embeds":
                     image_embeddings = image_input["data"]
-                elif self.dynamic_resolution:
-                    assert image_input["type"] == "pixel_values_dynamic"
+                elif image_input["type"] == "pixel_values_dynamic":
                     image_embeddings = self._process_image_input_dynamic(image_input)
                 else:
+                    assert image_input["type"] == "pixel_values"
                     image_embeddings = self._process_image_input(image_input)
                 multimodal_embeddings += tuple(image_embeddings)
             if modality == "videos":

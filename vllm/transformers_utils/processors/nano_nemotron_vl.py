@@ -8,6 +8,7 @@
 # --------------------------------------------------------
 
 import math
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -682,30 +683,169 @@ class BaseNanoNemotronVLProcessor(ABC):
         self,
         text: list[str],
         images: list[Image.Image],
-        max_num_tiles: int,
+        max_num_tiles: int | None,
+        use_fast_preprocessing: bool | None = None,
+        max_num_patches: int | None = None,
+        precomputed_imgs_sizes: list[list[int]] | None = None,
+        video_as_images: bool | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         if len(images) == 0:
             return text, {}
 
         image_inputs: dict[str, Any]
-        if tiler := self.dynamic_tiler:
+        tiler = None if max_num_tiles is not None else self.dynamic_tiler
+        if tiler:
             sans_images = text[0].replace("<image>", "")
             text_prompt_length = len(
                 self.tokenizer(sans_images, add_special_tokens=False).input_ids
             )
-            pixel_values_lst, num_tokens_per_image = tiler._images_to_pixel_values_lst(
-                text_prompt_length=text_prompt_length,
-                images=images,
-                dtype=self.dtype,
-            )
-            imgs_sizes = [(pv.shape[-2], pv.shape[-1]) for pv in pixel_values_lst]
+            if precomputed_imgs_sizes is not None and len(precomputed_imgs_sizes) == len(
+                images
+            ):
+                pixel_values_lst = []
+                num_tokens_per_image = []
+                imgs_sizes = []
+                for image, (target_h, target_w) in zip(
+                    images, precomputed_imgs_sizes, strict=True
+                ):
+                    target_h, target_w = int(target_h), int(target_w)
+                    resized = _bicubic_resize_and_normalize(
+                        _pil_to_nhwc_tensor(image),
+                        size=(target_h, target_w),
+                        norm_mean=self.norm_mean,
+                        norm_std=self.norm_std,
+                        dtype=self.dtype,
+                    )
+                    pixel_values_lst.extend(list(resized))
+                    imgs_sizes.append((target_h, target_w))
+                    num_tokens_per_image.append(
+                        tiler._get_num_embeddings(target_w, target_h)
+                    )
+                if os.environ.get("NRL_DEBUG", "0") == "1":
+                    print(
+                        "[VLLM_PRECOMPUTED_PATH] "
+                        f"using {len(imgs_sizes)} HF-resolved image sizes; "
+                        f"first_sizes={imgs_sizes[:3]}",
+                        flush=True,
+                    )
+            else:
+                old_max_num_patches = tiler._max_num_patches
+                if max_num_patches is not None:
+                    tiler._max_num_patches = (
+                        max_num_patches if max_num_patches > 0 else float("inf")
+                    )
+                try:
+                    pixel_values_lst, num_tokens_per_image = (
+                        tiler._images_to_pixel_values_lst(
+                            text_prompt_length=text_prompt_length,
+                            images=images,
+                            dtype=self.dtype,
+                        )
+                    )
+                finally:
+                    tiler._max_num_patches = old_max_num_patches
+                imgs_sizes = [(pv.shape[-2], pv.shape[-1]) for pv in pixel_values_lst]
             image_num_patches = torch.tensor([1] * len(num_tokens_per_image))
             image_inputs = {
                 "pixel_values_flat": pixel_values_lst,
                 "imgs_sizes": imgs_sizes,
                 "num_tokens_per_image": num_tokens_per_image,
             }
+        elif (
+            max_num_tiles == 1
+            and getattr(self, "video_target_num_patches", None) is not None
+            and len(images) > 1
+            and bool(video_as_images)
+        ):
+            temporal_patch_size = self.video_temporal_patch_size
+            num_images = len(images)
+            num_tubelets = math.ceil(num_images / temporal_patch_size)
+            num_padded = num_tubelets * temporal_patch_size
+            if num_padded > num_images:
+                images = list(images) + [images[-1]] * (num_padded - num_images)
+            patch_size = self.config.patch_size
+            downsample_ratio = self.config.downsample_ratio
+            target_patches = self.video_target_num_patches
+            orig_w, orig_h = images[0].width, images[0].height
+
+            if precomputed_imgs_sizes is not None and len(precomputed_imgs_sizes) > 0:
+                if len(precomputed_imgs_sizes) != num_images:
+                    raise ValueError(
+                        "video_as_images expected one precomputed target per "
+                        f"unpadded frame, got len(precomputed_imgs_sizes)="
+                        f"{len(precomputed_imgs_sizes)} for num_images={num_images}"
+                    )
+                unique_sizes = {
+                    (int(height), int(width))
+                    for height, width in precomputed_imgs_sizes
+                }
+                if len(unique_sizes) != 1:
+                    raise ValueError(
+                        "video_as_images expects one resize target across frames, "
+                        f"got {sorted(unique_sizes)}"
+                    )
+                target_h, target_w = next(iter(unique_sizes))
+            elif self.video_maintain_aspect_ratio:
+                target_w, target_h = _compute_aspect_preserving_size(
+                    orig_w=orig_w,
+                    orig_h=orig_h,
+                    target_num_patches=target_patches,
+                    patch_size=patch_size,
+                    downsample_ratio=downsample_ratio,
+                )
+            else:
+                reduction_factor = int(round(1 / downsample_ratio))
+                side = int(math.sqrt(target_patches))
+                side = max(
+                    reduction_factor,
+                    (side // reduction_factor) * reduction_factor,
+                )
+                target_w = side * patch_size
+                target_h = side * patch_size
+
+            frame_tensors = []
+            for image in images:
+                resized = _bicubic_resize_and_normalize(
+                    _pil_to_nhwc_tensor(image),
+                    size=(target_h, target_w),
+                    norm_mean=self.norm_mean,
+                    norm_std=self.norm_std,
+                    dtype=self.dtype,
+                )
+                frame_tensors.extend(list(resized))
+            pixel_values_flat = torch.stack(frame_tensors)
+            image_num_patches = torch.tensor(
+                [
+                    temporal_patch_size if i % temporal_patch_size == 0 else 0
+                    for i in range(num_images)
+                ]
+            )
+            tokens_per_tubelet = int(
+                (target_h // patch_size)
+                * downsample_ratio
+                * (target_w // patch_size)
+                * downsample_ratio
+            )
+            num_tokens_per_image = [
+                tokens_per_tubelet if i % temporal_patch_size == 0 else 0
+                for i in range(num_images)
+            ]
+            image_inputs = {
+                "pixel_values_flat": pixel_values_flat,
+                "image_num_patches": image_num_patches,
+                "imgs_sizes": [(target_h, target_w)] * num_images,
+            }
+            if os.environ.get("NRL_DEBUG", "0") == "1":
+                print(
+                    "[VLLM_VIDEO_AS_IMAGES] "
+                    f"orig=({orig_w}x{orig_h}) target=({target_w}x{target_h}) "
+                    f"frames={num_images} T={temporal_patch_size} "
+                    f"tokens_per_tubelet={tokens_per_tubelet} "
+                    f"num_tokens_per_image={num_tokens_per_image[:8]}",
+                    flush=True,
+                )
         else:
+            max_num_tiles = max_num_tiles or self.max_num_tiles
             pixel_values_lst = self._images_to_pixel_values_lst(images, max_num_tiles)
             image_num_patches = torch.tensor([len(item) for item in pixel_values_lst])
             pixel_values_flat = (
@@ -731,11 +871,15 @@ class BaseNanoNemotronVLProcessor(ABC):
             f"but found {parts.count('<image>')}"
         )
 
-        for i, (feature_size, num_patches) in enumerate(
-            zip(num_tokens_per_image, image_num_patches, strict=True)
-        ):
+        image_idx = 0
+        for part_idx, part in enumerate(parts):
+            if part != "<image>":
+                continue
+            feature_size = num_tokens_per_image[image_idx]
+            num_patches = image_num_patches[image_idx]
             image_repl = self.get_image_repl(feature_size, num_patches)
-            parts[i] = parts[i].replace("<image>", image_repl.full)
+            parts[part_idx] = image_repl.full
+            image_idx += 1
         text = ["".join(parts)]
 
         return text, image_inputs
@@ -777,6 +921,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         video_token: str | None = None,
         video_pruning_rate: float | None = None,
         use_audio_in_video: bool = False,
+        **kwargs: object,
     ) -> None:
         super().__init__(
             config=config,
@@ -1023,12 +1168,12 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         *,
         return_tensors: str | TensorType | None = None,
         max_num_tiles: int | None = None,
+        use_fast_preprocessing: bool | None = None,
+        max_num_patches: int | None = None,
+        precomputed_imgs_sizes: list[list[int]] | None = None,
+        video_as_images: bool | None = None,
         **kwargs,
     ) -> BatchFeature:
-        # Use default if not provided
-        if max_num_tiles is None:
-            max_num_tiles = self.max_num_tiles
-
         text = self._make_batch_input(text)
         images = self._make_batch_input(images)
         videos = self._make_batch_input(videos)
@@ -1038,6 +1183,10 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             text=text,
             images=images,
             max_num_tiles=max_num_tiles,
+            use_fast_preprocessing=use_fast_preprocessing,
+            max_num_patches=max_num_patches,
+            precomputed_imgs_sizes=precomputed_imgs_sizes,
+            video_as_images=video_as_images,
         )
 
         text, video_inputs = self._preprocess_video(
@@ -1084,6 +1233,13 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         feature_size: int,
         num_patches: int | None,
     ) -> PromptUpdateDetails[str]:
+        # VLLM_ZERO_IMAGE_REPL_WRAPPER: keep a wrapper-only placeholder so
+        # vLLM's multimodal item accounting still sees secondary video frames.
+        if feature_size == 0:
+            patch_count = 0 if num_patches is None else int(num_patches)
+            if patch_count == 0:
+                return PromptUpdateDetails.select_text(IMG_START + IMG_END, IMG_CONTEXT)
+
         repl_features = IMG_CONTEXT * feature_size
         repl_full = IMG_START + repl_features + IMG_END
 
