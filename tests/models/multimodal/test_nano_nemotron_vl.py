@@ -4,6 +4,10 @@
 import pytest
 
 from vllm.model_executor.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
+from vllm.transformers_utils.processors.nano_nemotron_vl import (
+    NanoNemotronVLProcessor,
+    _compute_aspect_preserving_size,
+)
 
 
 class _TextOnlyMultiModalConfig:
@@ -51,6 +55,70 @@ class _VisionModel:
 
     def load_weights(self, weights):
         self.loaded_weights = list(weights)
+
+
+class _EmptySeparatorTokenizer:
+    def __call__(
+        self,
+        texts,
+        *,
+        add_special_tokens=False,
+        return_attention_mask=False,
+    ):
+        assert add_special_tokens is False
+        assert return_attention_mask is False
+        return {"input_ids": [[] for _ in texts]}
+
+
+@pytest.mark.parametrize(
+    ("orig_w", "orig_h", "expected_size"),
+    [
+        (480, 320, (640, 416)),
+        (640, 424, (640, 416)),
+        (1152, 720, (640, 416)),
+        (1280, 720, (672, 384)),
+    ],
+)
+def test_nano_nemotron_vl_video_target_size_matches_policy_processor(
+    orig_w, orig_h, expected_size
+):
+    assert (
+        _compute_aspect_preserving_size(
+            orig_w=orig_w,
+            orig_h=orig_h,
+            target_num_patches=1024,
+            patch_size=16,
+            downsample_ratio=0.5,
+        )
+        == expected_size
+    )
+
+
+def test_nano_nemotron_vl_native_video_replaces_context_tokens_only(monkeypatch):
+    monkeypatch.setenv("NRL_VLLM_VIDEO_FRAME_SEPARATORS", "0")
+
+    repl = NanoNemotronVLProcessor.get_video_repl(
+        tokens_per_frame=[2, 1],
+        frames_indices=[0, 1, 2, 3],
+        frame_duration_ms=500,
+        tokenizer=_EmptySeparatorTokenizer(),
+        img_start_token_ids=[101],
+        img_end_token_ids=[102],
+        img_context_token_ids=[103],
+        video_temporal_patch_size=2,
+    )
+
+    assert repl.full == [101, 103, 103, 102, 101, 103, 102]
+    assert repl.is_embed is not None
+    assert repl.is_embed(None, repl.full).tolist() == [
+        False,
+        True,
+        True,
+        False,
+        False,
+        True,
+        False,
+    ]
 
 
 def test_nano_nemotron_vl_skips_multimodal_weights_in_text_only_mode():

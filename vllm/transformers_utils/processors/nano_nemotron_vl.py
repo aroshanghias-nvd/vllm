@@ -41,6 +41,43 @@ AUDIO_START = "<so_start>"
 AUDIO_END = "<so_end>"
 AUDIO_CONTEXT = "<so_embedding>"
 
+
+_NRL_DEBUG_ONCE: set[str] = set()
+_NRL_DEBUG_GROUP_COUNTS: dict[str, int] = {}
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
+
+
+def _nrl_debug_once(key: str, message: str) -> None:
+    if not _env_flag("NRL_DEBUG"):
+        return
+    if key in _NRL_DEBUG_ONCE:
+        return
+    _NRL_DEBUG_ONCE.add(key)
+    print(message, flush=True)
+
+
+def _nrl_debug_limited(
+    group: str,
+    key: str,
+    message: str,
+    *,
+    limit: int = 8,
+) -> None:
+    if not _env_flag("NRL_DEBUG"):
+        return
+    if key in _NRL_DEBUG_ONCE:
+        return
+    count = _NRL_DEBUG_GROUP_COUNTS.get(group, 0)
+    if count >= limit:
+        return
+    _NRL_DEBUG_GROUP_COUNTS[group] = count + 1
+    _NRL_DEBUG_ONCE.add(key)
+    print(message, flush=True)
+
+
 # Profiling
 # MAX_FRAMES = 16
 DEFAULT_NUM_TILES = 12
@@ -171,18 +208,22 @@ def _compute_aspect_preserving_size(
 
     reduction_factor = int(round(1 / downsample_ratio))
     required_divisor = reduction_factor  # 2 for pixel-shuffle
+    over_target = ph * pw > target_num_patches
     if required_divisor > 1:
         rem_h = ph % required_divisor
         rem_w = pw % required_divisor
-        ph_up = ph + (required_divisor - rem_h if rem_h else 0)
-        ph_down = ph - rem_h
-        pw_up = pw + (required_divisor - rem_w if rem_w else 0)
-        pw_down = pw - rem_w
-        if ph_up * pw_up <= target_num_patches:
-            ph, pw = ph_up, pw_up
-        else:
-            ph = max(required_divisor, ph_down)
-            pw = max(required_divisor, pw_down)
+        if rem_h != 0:
+            if over_target:
+                ph -= rem_h
+            else:
+                ph += required_divisor - rem_h
+        if rem_w != 0:
+            if over_target:
+                pw -= rem_w
+            else:
+                pw += required_divisor - rem_w
+        ph = max(required_divisor, ph)
+        pw = max(required_divisor, pw)
 
     return pw * patch_size, ph * patch_size  # (width, height) in pixels
 
@@ -217,6 +258,20 @@ def get_video_target_size_and_feature_size(
 
     feature_size = int((target_h // patch_size) * downsample_ratio) * int(
         (target_w // patch_size) * downsample_ratio
+    )
+    _nrl_debug_limited(
+        "video_target_size",
+        (
+            f"video_target_size:{orig_w}x{orig_h}:"
+            f"{target_patches}:{maintain_aspect_ratio}:"
+            f"{patch_size}:{downsample_ratio}"
+        ),
+        "[VLLM_VIDEO_TARGET_SIZE] "
+        f"orig=({orig_w}x{orig_h}) target=({target_w}x{target_h}) "
+        f"target_patches={target_patches} "
+        f"maintain_aspect={maintain_aspect_ratio} "
+        f"patch_size={patch_size} downsample_ratio={downsample_ratio} "
+        f"feature_size={feature_size}",
     )
     return target_w, target_h, feature_size
 
@@ -1269,14 +1324,10 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
     ) -> PromptUpdateDetails[list[int]]:
         """
         Build prompt replacement for a video.
-        The replacement returned is not actually used to replace the placeholder
-        tokens - it's just used to make sure we allocate the correct number
-        of tokens.
-        Actual replacement is done in embed_multimodal of
-        NemotronH_Nano_VL_V2
-        (specifically in _process_video_input -> _create_final_video_embeddings).
-        There, we create the final embeddings with text embeddings for indicator tokens
-        and video embeddings for video tokens.
+        The replacement expands the `<video>` placeholder into the same
+        image-wrapper token pattern used by video-as-images. Only image context
+        tokens are marked as embedding positions; wrapper/separator tokens stay
+        text tokens.
         This is a single function that handles all cases - non EVS, EVS dummy, EVS real.
         The differentiation is done via tokens_per_frame parameter.
         - non EVS case - constant value same value across all frames
@@ -1302,7 +1353,18 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         T = video_temporal_patch_size
         num_frames = len(frames_indices)
 
-        if T > 1 and timestamps_enabled:
+        use_frame_separators = _env_flag("NRL_VLLM_VIDEO_FRAME_SEPARATORS", "0")
+        if not use_frame_separators:
+            frame_separators = [""] * len(tokens_per_frame)
+            _nrl_debug_once(
+                "native_video_plain_repl",
+                "[VLLM_NATIVE_VIDEO_REPL] "
+                "frame_separators=0 "
+                f"T={T} frames={num_frames} "
+                f"tubelets={len(tokens_per_frame)} "
+                f"tokens_per_frame_head={tokens_per_frame[:8]}",
+            )
+        elif T > 1 and timestamps_enabled:
             all_timestamps = calculate_timestamps(frames_indices, frame_duration_ms)
 
             frame_separators = []
@@ -1360,4 +1422,21 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             all_token_ids.extend(img_context_token_ids * num_tokens)
             all_token_ids.extend(img_end_token_ids)
 
-        return PromptUpdateDetails.from_seq(all_token_ids)
+        embed_token_count = sum(tokens_per_frame) * len(img_context_token_ids)
+        _nrl_debug_limited(
+            "native_video_repl_contract",
+            (
+                "native_video_repl_contract:"
+                f"{len(all_token_ids)}:{embed_token_count}:"
+                f"{len(tokens_per_frame)}:{T}"
+            ),
+            "[VLLM_NATIVE_VIDEO_REPL_CONTRACT] "
+            f"full_tokens={len(all_token_ids)} "
+            f"embed_tokens={embed_token_count} "
+            f"text_tokens={len(all_token_ids) - embed_token_count} "
+            f"tubelets={len(tokens_per_frame)} T={T}",
+        )
+
+        return PromptUpdateDetails.select_token_ids(
+            all_token_ids, img_context_token_ids
+        )
