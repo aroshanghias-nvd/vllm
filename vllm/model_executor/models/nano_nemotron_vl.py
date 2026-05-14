@@ -109,6 +109,15 @@ logger = init_logger(__name__)
 MAX_AUDIO_LEN_S = 10 * 60  # 10 minutes
 
 
+def _use_sft_v2_video_frame_separators() -> bool:
+    return (
+        os.environ.get("NRL_VLLM_VIDEO_FRAME_SEPARATORS", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+        or os.environ.get("NRL_VIDEO_PROMPT_STYLE", "").strip().lower()
+        == "sft_v2_grouped"
+    )
+
+
 class NanoNemotronVLAudioFeatureInputs(TensorSchema):
     """
     Dimensions:
@@ -218,12 +227,7 @@ class NanoNemotronVLProcessingInfo(BaseProcessingInfo):
             max_model_len=self.ctx.model_config.max_model_len,
             **kwargs,
         )
-        use_frame_separators = (
-            os.environ.get("NRL_VLLM_VIDEO_FRAME_SEPARATORS", "0")
-            .strip()
-            .lower()
-            in ("1", "true", "yes", "on")
-        )
+        use_frame_separators = _use_sft_v2_video_frame_separators()
         if not use_frame_separators:
 
             def get_video_repl_plain(
@@ -670,12 +674,7 @@ class NanoNemotronVLMultiModalProcessor(
                 tokens_per_frame = [feature_size] * num_tubelets
 
             frame_duration_ms = int(1000 / metadata["fps"])
-            use_frame_separators = (
-                os.environ.get("NRL_VLLM_VIDEO_FRAME_SEPARATORS", "0")
-                .strip()
-                .lower()
-                in ("1", "true", "yes", "on")
-            )
+            use_frame_separators = _use_sft_v2_video_frame_separators()
             if not use_frame_separators:
                 img_context_token_ids = list(hf_processor._img_context_token_ids)
                 all_token_ids: list[int] = []
@@ -765,7 +764,41 @@ class NanoNemotronVLMultiModalProcessor(
     ):
         def get_audio_replacement(item_idx: int):
             audios = mm_items.get_items("audio", AudioProcessorItems)
-            return hf_processor.get_audio_repl(audios.get(item_idx))
+            audio = audios.get(item_idx)
+            audio_repl = hf_processor.get_audio_repl(audio)
+            if os.environ.get("NRL_DEBUG", "0") == "1":
+                extractor = getattr(hf_processor, "audio_extractor", None)
+                clip_sizes = (
+                    extractor._clip_sizes(len(audio))
+                    if extractor is not None
+                    else []
+                )
+                sampling_rate = (
+                    getattr(getattr(extractor, "config", None), "sampling_rate", None)
+                    if extractor is not None
+                    else None
+                )
+                repl_full = audio_repl.full
+                context_tokens = (
+                    repl_full.count(AUDIO_CONTEXT)
+                    if isinstance(repl_full, str)
+                    else len(repl_full)
+                )
+                duration_s = (
+                    len(audio) / float(sampling_rate) if sampling_rate else None
+                )
+                print(
+                    "[VLLM_AUDIO_REPL_MODEL] "
+                    f"item_idx={item_idx} "
+                    f"audio_len={len(audio)} "
+                    f"duration_s={duration_s} "
+                    f"sampling_rate={sampling_rate} "
+                    f"num_clips={len(clip_sizes)} "
+                    f"clip_samples={clip_sizes} "
+                    f"context_tokens={context_tokens}",
+                    flush=True,
+                )
+            return audio_repl
 
         return PromptReplacement(
             modality="audio",

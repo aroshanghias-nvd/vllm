@@ -50,6 +50,14 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
 
 
+def _use_sft_v2_video_frame_separators() -> bool:
+    return (
+        _env_flag("NRL_VLLM_VIDEO_FRAME_SEPARATORS", "0")
+        or os.environ.get("NRL_VIDEO_PROMPT_STYLE", "").strip().lower()
+        == "sft_v2_grouped"
+    )
+
+
 def _nrl_debug_once(key: str, message: str) -> None:
     if not _env_flag("NRL_DEBUG"):
         return
@@ -1306,6 +1314,19 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
     ) -> PromptUpdateDetails[str]:
         assert self.audio_extractor is not None
         num_tokens = self.audio_extractor.audio_token_count(len(audio))
+        if _env_flag("NRL_DEBUG"):
+            clip_sizes = self.audio_extractor._clip_sizes(len(audio))
+            sampling_rate = self.audio_extractor.config.sampling_rate
+            print(
+                "[VLLM_AUDIO_REPL_PROCESSOR] "
+                f"audio_len={len(audio)} "
+                f"duration_s={len(audio) / float(sampling_rate):.6f} "
+                f"sampling_rate={sampling_rate} "
+                f"num_clips={len(clip_sizes)} "
+                f"clip_samples={clip_sizes} "
+                f"num_tokens={num_tokens}",
+                flush=True,
+            )
         repl_full = f"{AUDIO_START}{AUDIO_CONTEXT * num_tokens}{AUDIO_END}"
         return PromptUpdateDetails.select_text(repl_full, AUDIO_CONTEXT)
 
@@ -1353,7 +1374,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         T = video_temporal_patch_size
         num_frames = len(frames_indices)
 
-        use_frame_separators = _env_flag("NRL_VLLM_VIDEO_FRAME_SEPARATORS", "0")
+        use_frame_separators = _use_sft_v2_video_frame_separators()
         if not use_frame_separators:
             frame_separators = [""] * len(tokens_per_frame)
             _nrl_debug_once(
@@ -1402,6 +1423,20 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
                 ("\n" if i > 0 else "") + f"Frame {i + 1}: "
                 for i, _ in enumerate(tokens_per_frame)
             ]
+
+        if use_frame_separators:
+            _nrl_debug_limited(
+                "native_video_repl_separator",
+                (
+                    "native_video_repl_separator:"
+                    f"{num_frames}:{len(tokens_per_frame)}:{T}:"
+                    f"{frame_separators[:2]}"
+                ),
+                "[VLLM_NATIVE_VIDEO_REPL_SEPARATOR] "
+                "frame_separators=1 "
+                f"T={T} frames={num_frames} tubelets={len(tokens_per_frame)} "
+                f"separators_head={frame_separators[:2]}",
+            )
 
         # Batch-tokenize all frame separators at once — the HuggingFace
         # tokenizers Rust backend parallelizes batch encoding across threads.

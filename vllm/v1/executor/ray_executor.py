@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import sys
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -84,7 +85,9 @@ class RayDistributedExecutor(Executor):
             os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 
         # Create the parallel GPU workers.
-        self._init_workers_ray(placement_group)
+        self._init_workers_ray(
+            placement_group, runtime_env={"py_executable": sys.executable}
+        )
 
         # KV connector setup
         self.has_connector = self.vllm_config.kv_transfer_config is not None
