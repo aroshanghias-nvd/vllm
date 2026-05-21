@@ -8,7 +8,6 @@
 # --------------------------------------------------------
 
 import math
-import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -40,51 +39,6 @@ IMG_CONTEXT = "<image>"
 AUDIO_START = "<so_start>"
 AUDIO_END = "<so_end>"
 AUDIO_CONTEXT = "<so_embedding>"
-
-
-_NRL_DEBUG_ONCE: set[str] = set()
-_NRL_DEBUG_GROUP_COUNTS: dict[str, int] = {}
-
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
-
-
-def _use_sft_v2_video_frame_separators() -> bool:
-    return (
-        _env_flag("NRL_VLLM_VIDEO_FRAME_SEPARATORS", "0")
-        or os.environ.get("NRL_VIDEO_PROMPT_STYLE", "").strip().lower()
-        == "sft_v2_grouped"
-    )
-
-
-def _nrl_debug_once(key: str, message: str) -> None:
-    if not _env_flag("NRL_DEBUG"):
-        return
-    if key in _NRL_DEBUG_ONCE:
-        return
-    _NRL_DEBUG_ONCE.add(key)
-    print(message, flush=True)
-
-
-def _nrl_debug_limited(
-    group: str,
-    key: str,
-    message: str,
-    *,
-    limit: int = 8,
-) -> None:
-    if not _env_flag("NRL_DEBUG"):
-        return
-    if key in _NRL_DEBUG_ONCE:
-        return
-    count = _NRL_DEBUG_GROUP_COUNTS.get(group, 0)
-    if count >= limit:
-        return
-    _NRL_DEBUG_GROUP_COUNTS[group] = count + 1
-    _NRL_DEBUG_ONCE.add(key)
-    print(message, flush=True)
-
 
 # Profiling
 # MAX_FRAMES = 16
@@ -216,22 +170,18 @@ def _compute_aspect_preserving_size(
 
     reduction_factor = int(round(1 / downsample_ratio))
     required_divisor = reduction_factor  # 2 for pixel-shuffle
-    over_target = ph * pw > target_num_patches
     if required_divisor > 1:
         rem_h = ph % required_divisor
         rem_w = pw % required_divisor
-        if rem_h != 0:
-            if over_target:
-                ph -= rem_h
-            else:
-                ph += required_divisor - rem_h
-        if rem_w != 0:
-            if over_target:
-                pw -= rem_w
-            else:
-                pw += required_divisor - rem_w
-        ph = max(required_divisor, ph)
-        pw = max(required_divisor, pw)
+        ph_up = ph + (required_divisor - rem_h if rem_h else 0)
+        ph_down = ph - rem_h
+        pw_up = pw + (required_divisor - rem_w if rem_w else 0)
+        pw_down = pw - rem_w
+        if ph_up * pw_up <= target_num_patches:
+            ph, pw = ph_up, pw_up
+        else:
+            ph = max(required_divisor, ph_down)
+            pw = max(required_divisor, pw_down)
 
     return pw * patch_size, ph * patch_size  # (width, height) in pixels
 
@@ -266,20 +216,6 @@ def get_video_target_size_and_feature_size(
 
     feature_size = int((target_h // patch_size) * downsample_ratio) * int(
         (target_w // patch_size) * downsample_ratio
-    )
-    _nrl_debug_limited(
-        "video_target_size",
-        (
-            f"video_target_size:{orig_w}x{orig_h}:"
-            f"{target_patches}:{maintain_aspect_ratio}:"
-            f"{patch_size}:{downsample_ratio}"
-        ),
-        "[VLLM_VIDEO_TARGET_SIZE] "
-        f"orig=({orig_w}x{orig_h}) target=({target_w}x{target_h}) "
-        f"target_patches={target_patches} "
-        f"maintain_aspect={maintain_aspect_ratio} "
-        f"patch_size={patch_size} downsample_ratio={downsample_ratio} "
-        f"feature_size={feature_size}",
     )
     return target_w, target_h, feature_size
 
@@ -750,7 +686,6 @@ class BaseNanoNemotronVLProcessor(ABC):
         use_fast_preprocessing: bool | None = None,
         max_num_patches: int | None = None,
         precomputed_imgs_sizes: list[list[int]] | None = None,
-        video_as_images: bool | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         if len(images) == 0:
             return text, {}
@@ -784,13 +719,6 @@ class BaseNanoNemotronVLProcessor(ABC):
                     num_tokens_per_image.append(
                         tiler._get_num_embeddings(target_w, target_h)
                     )
-                if os.environ.get("NRL_DEBUG", "0") == "1":
-                    print(
-                        "[VLLM_PRECOMPUTED_PATH] "
-                        f"using {len(imgs_sizes)} HF-resolved image sizes; "
-                        f"first_sizes={imgs_sizes[:3]}",
-                        flush=True,
-                    )
             else:
                 old_max_num_patches = tiler._max_num_patches
                 if max_num_patches is not None:
@@ -814,99 +742,6 @@ class BaseNanoNemotronVLProcessor(ABC):
                 "imgs_sizes": imgs_sizes,
                 "num_tokens_per_image": num_tokens_per_image,
             }
-        elif (
-            max_num_tiles == 1
-            and getattr(self, "video_target_num_patches", None) is not None
-            and len(images) > 1
-            and bool(video_as_images)
-        ):
-            temporal_patch_size = self.video_temporal_patch_size
-            num_images = len(images)
-            num_tubelets = math.ceil(num_images / temporal_patch_size)
-            num_padded = num_tubelets * temporal_patch_size
-            if num_padded > num_images:
-                images = list(images) + [images[-1]] * (num_padded - num_images)
-            patch_size = self.config.patch_size
-            downsample_ratio = self.config.downsample_ratio
-            target_patches = self.video_target_num_patches
-            orig_w, orig_h = images[0].width, images[0].height
-
-            if precomputed_imgs_sizes is not None and len(precomputed_imgs_sizes) > 0:
-                if len(precomputed_imgs_sizes) != num_images:
-                    raise ValueError(
-                        "video_as_images expected one precomputed target per "
-                        f"unpadded frame, got len(precomputed_imgs_sizes)="
-                        f"{len(precomputed_imgs_sizes)} for num_images={num_images}"
-                    )
-                unique_sizes = {
-                    (int(height), int(width))
-                    for height, width in precomputed_imgs_sizes
-                }
-                if len(unique_sizes) != 1:
-                    raise ValueError(
-                        "video_as_images expects one resize target across frames, "
-                        f"got {sorted(unique_sizes)}"
-                    )
-                target_h, target_w = next(iter(unique_sizes))
-            elif self.video_maintain_aspect_ratio:
-                target_w, target_h = _compute_aspect_preserving_size(
-                    orig_w=orig_w,
-                    orig_h=orig_h,
-                    target_num_patches=target_patches,
-                    patch_size=patch_size,
-                    downsample_ratio=downsample_ratio,
-                )
-            else:
-                reduction_factor = int(round(1 / downsample_ratio))
-                side = int(math.sqrt(target_patches))
-                side = max(
-                    reduction_factor,
-                    (side // reduction_factor) * reduction_factor,
-                )
-                target_w = side * patch_size
-                target_h = side * patch_size
-
-            frame_tensors = []
-            for image in images:
-                resized = _bicubic_resize_and_normalize(
-                    _pil_to_nhwc_tensor(image),
-                    size=(target_h, target_w),
-                    norm_mean=self.norm_mean,
-                    norm_std=self.norm_std,
-                    dtype=self.dtype,
-                )
-                frame_tensors.extend(list(resized))
-            pixel_values_flat = torch.stack(frame_tensors)
-            image_num_patches = torch.tensor(
-                [
-                    temporal_patch_size if i % temporal_patch_size == 0 else 0
-                    for i in range(num_images)
-                ]
-            )
-            tokens_per_tubelet = int(
-                (target_h // patch_size)
-                * downsample_ratio
-                * (target_w // patch_size)
-                * downsample_ratio
-            )
-            num_tokens_per_image = [
-                tokens_per_tubelet if i % temporal_patch_size == 0 else 0
-                for i in range(num_images)
-            ]
-            image_inputs = {
-                "pixel_values_flat": pixel_values_flat,
-                "image_num_patches": image_num_patches,
-                "imgs_sizes": [(target_h, target_w)] * num_images,
-            }
-            if os.environ.get("NRL_DEBUG", "0") == "1":
-                print(
-                    "[VLLM_VIDEO_AS_IMAGES] "
-                    f"orig=({orig_w}x{orig_h}) target=({target_w}x{target_h}) "
-                    f"frames={num_images} T={temporal_patch_size} "
-                    f"tokens_per_tubelet={tokens_per_tubelet} "
-                    f"num_tokens_per_image={num_tokens_per_image[:8]}",
-                    flush=True,
-                )
         else:
             max_num_tiles = max_num_tiles or self.max_num_tiles
             pixel_values_lst = self._images_to_pixel_values_lst(images, max_num_tiles)
@@ -1234,7 +1069,6 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         use_fast_preprocessing: bool | None = None,
         max_num_patches: int | None = None,
         precomputed_imgs_sizes: list[list[int]] | None = None,
-        video_as_images: bool | None = None,
         **kwargs,
     ) -> BatchFeature:
         text = self._make_batch_input(text)
@@ -1249,7 +1083,6 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             use_fast_preprocessing=use_fast_preprocessing,
             max_num_patches=max_num_patches,
             precomputed_imgs_sizes=precomputed_imgs_sizes,
-            video_as_images=video_as_images,
         )
 
         text, video_inputs = self._preprocess_video(
@@ -1296,13 +1129,6 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         feature_size: int,
         num_patches: int | None,
     ) -> PromptUpdateDetails[str]:
-        # VLLM_ZERO_IMAGE_REPL_WRAPPER: keep a wrapper-only placeholder so
-        # vLLM's multimodal item accounting still sees secondary video frames.
-        if feature_size == 0:
-            patch_count = 0 if num_patches is None else int(num_patches)
-            if patch_count == 0:
-                return PromptUpdateDetails.select_text(IMG_START + IMG_END, IMG_CONTEXT)
-
         repl_features = IMG_CONTEXT * feature_size
         repl_full = IMG_START + repl_features + IMG_END
 
@@ -1314,19 +1140,6 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
     ) -> PromptUpdateDetails[str]:
         assert self.audio_extractor is not None
         num_tokens = self.audio_extractor.audio_token_count(len(audio))
-        if _env_flag("NRL_DEBUG"):
-            clip_sizes = self.audio_extractor._clip_sizes(len(audio))
-            sampling_rate = self.audio_extractor.config.sampling_rate
-            print(
-                "[VLLM_AUDIO_REPL_PROCESSOR] "
-                f"audio_len={len(audio)} "
-                f"duration_s={len(audio) / float(sampling_rate):.6f} "
-                f"sampling_rate={sampling_rate} "
-                f"num_clips={len(clip_sizes)} "
-                f"clip_samples={clip_sizes} "
-                f"num_tokens={num_tokens}",
-                flush=True,
-            )
         repl_full = f"{AUDIO_START}{AUDIO_CONTEXT * num_tokens}{AUDIO_END}"
         return PromptUpdateDetails.select_text(repl_full, AUDIO_CONTEXT)
 
@@ -1345,10 +1158,9 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
     ) -> PromptUpdateDetails[list[int]]:
         """
         Build prompt replacement for a video.
-        The replacement expands the `<video>` placeholder into the same
-        image-wrapper token pattern used by video-as-images. Only image context
-        tokens are marked as embedding positions; wrapper/separator tokens stay
-        text tokens.
+        The replacement expands the `<video>` placeholder into frame separator
+        text plus image-wrapper tokens. Only image context tokens are marked as
+        embedding positions; wrapper/separator tokens stay text tokens.
         This is a single function that handles all cases - non EVS, EVS dummy, EVS real.
         The differentiation is done via tokens_per_frame parameter.
         - non EVS case - constant value same value across all frames
@@ -1374,18 +1186,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         T = video_temporal_patch_size
         num_frames = len(frames_indices)
 
-        use_frame_separators = _use_sft_v2_video_frame_separators()
-        if not use_frame_separators:
-            frame_separators = [""] * len(tokens_per_frame)
-            _nrl_debug_once(
-                "native_video_plain_repl",
-                "[VLLM_NATIVE_VIDEO_REPL] "
-                "frame_separators=0 "
-                f"T={T} frames={num_frames} "
-                f"tubelets={len(tokens_per_frame)} "
-                f"tokens_per_frame_head={tokens_per_frame[:8]}",
-            )
-        elif T > 1 and timestamps_enabled:
+        if T > 1 and timestamps_enabled:
             all_timestamps = calculate_timestamps(frames_indices, frame_duration_ms)
 
             frame_separators = []
@@ -1424,20 +1225,6 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
                 for i, _ in enumerate(tokens_per_frame)
             ]
 
-        if use_frame_separators:
-            _nrl_debug_limited(
-                "native_video_repl_separator",
-                (
-                    "native_video_repl_separator:"
-                    f"{num_frames}:{len(tokens_per_frame)}:{T}:"
-                    f"{frame_separators[:2]}"
-                ),
-                "[VLLM_NATIVE_VIDEO_REPL_SEPARATOR] "
-                "frame_separators=1 "
-                f"T={T} frames={num_frames} tubelets={len(tokens_per_frame)} "
-                f"separators_head={frame_separators[:2]}",
-            )
-
         # Batch-tokenize all frame separators at once — the HuggingFace
         # tokenizers Rust backend parallelizes batch encoding across threads.
         batch_encoded = tokenizer(
@@ -1456,21 +1243,6 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             all_token_ids.extend(img_start_token_ids)
             all_token_ids.extend(img_context_token_ids * num_tokens)
             all_token_ids.extend(img_end_token_ids)
-
-        embed_token_count = sum(tokens_per_frame) * len(img_context_token_ids)
-        _nrl_debug_limited(
-            "native_video_repl_contract",
-            (
-                "native_video_repl_contract:"
-                f"{len(all_token_ids)}:{embed_token_count}:"
-                f"{len(tokens_per_frame)}:{T}"
-            ),
-            "[VLLM_NATIVE_VIDEO_REPL_CONTRACT] "
-            f"full_tokens={len(all_token_ids)} "
-            f"embed_tokens={embed_token_count} "
-            f"text_tokens={len(all_token_ids) - embed_token_count} "
-            f"tubelets={len(tokens_per_frame)} T={T}",
-        )
 
         return PromptUpdateDetails.select_token_ids(
             all_token_ids, img_context_token_ids

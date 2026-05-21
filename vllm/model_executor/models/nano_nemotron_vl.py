@@ -8,7 +8,6 @@
 # --------------------------------------------------------
 
 import math
-import os
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from functools import cached_property
@@ -21,13 +20,7 @@ from transformers import BatchFeature, PretrainedConfig
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
-try:
-    from vllm.inputs import MultiModalDataDict, MultiModalInput
-except ImportError:
-    MultiModalDataDict: TypeAlias = Mapping[str, object]
-
-    def MultiModalInput(**kwargs: object) -> dict[str, object]:
-        return dict(kwargs)
+from vllm.inputs import MultiModalDataDict, MultiModalInput
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -60,10 +53,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItems,
     VideoItem,
 )
-try:
-    from vllm.multimodal.media.audio import load_audio_pyav
-except ImportError:
-    from vllm.multimodal.media.audio import load_audio as load_audio_pyav
+from vllm.multimodal.media.audio import load_audio_pyav
 from vllm.multimodal.parse import (
     AudioProcessorItems,
     ImageEmbeddingItems,
@@ -102,20 +92,9 @@ from vllm.transformers_utils.processors.nano_nemotron_vl import (
 )
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
-from .utils import _merge_multimodal_embeddings
-
 logger = init_logger(__name__)
 
 MAX_AUDIO_LEN_S = 10 * 60  # 10 minutes
-
-
-def _use_sft_v2_video_frame_separators() -> bool:
-    return (
-        os.environ.get("NRL_VLLM_VIDEO_FRAME_SEPARATORS", "0").strip().lower()
-        in ("1", "true", "yes", "on")
-        or os.environ.get("NRL_VIDEO_PROMPT_STYLE", "").strip().lower()
-        == "sft_v2_grouped"
-    )
 
 
 class NanoNemotronVLAudioFeatureInputs(TensorSchema):
@@ -218,7 +197,7 @@ NanoNemotronVLVideoInputs: TypeAlias = (
 
 class NanoNemotronVLProcessingInfo(BaseProcessingInfo):
     def get_hf_processor(self, **kwargs: object) -> NanoNemotronVLProcessor:
-        processor = self.ctx.init_processor(
+        return self.ctx.init_processor(
             NanoNemotronVLProcessor,
             config=self.get_hf_config(),
             tokenizer=self.get_tokenizer(),
@@ -227,59 +206,6 @@ class NanoNemotronVLProcessingInfo(BaseProcessingInfo):
             max_model_len=self.ctx.model_config.max_model_len,
             **kwargs,
         )
-        use_frame_separators = _use_sft_v2_video_frame_separators()
-        if not use_frame_separators:
-
-            def get_video_repl_plain(
-                *,
-                tokens_per_frame: list[int],
-                frames_indices: list[int],
-                frame_duration_ms: int,
-                tokenizer,
-                img_start_token_ids: list[int],
-                img_end_token_ids: list[int],
-                img_context_token_ids: list[int],
-                video_temporal_patch_size: int = 1,
-            ) -> PromptUpdateDetails[list[int]]:
-                del frames_indices, frame_duration_ms
-                all_token_ids: list[int] = []
-                for num_tokens in tokens_per_frame:
-                    all_token_ids.extend(img_start_token_ids)
-                    all_token_ids.extend(img_context_token_ids * num_tokens)
-                    all_token_ids.extend(img_end_token_ids)
-
-                def is_embed(tokenizer, full):
-                    token_ids = (
-                        full
-                        if isinstance(full, list)
-                        else tokenizer.encode(full, add_special_tokens=False)
-                    )
-                    return torch.isin(
-                        torch.tensor(token_ids),
-                        torch.tensor(img_context_token_ids),
-                    )
-
-                embed_token_count = sum(tokens_per_frame) * len(img_context_token_ids)
-                if os.environ.get("NRL_DEBUG", "0") == "1":
-                    print(
-                        "[VLLM_NATIVE_VIDEO_REPL_PROCESSOR_PLAIN] "
-                        "frame_separators=0 "
-                        f"full_tokens={len(all_token_ids)} "
-                        f"embed_tokens={embed_token_count} "
-                        f"text_tokens={len(all_token_ids) - embed_token_count} "
-                        f"tubelets={len(tokens_per_frame)} "
-                        f"T={video_temporal_patch_size}",
-                        flush=True,
-                    )
-
-                return PromptUpdateDetails(
-                    full=all_token_ids,
-                    is_embed=is_embed,
-                )
-
-            processor.get_video_repl = get_video_repl_plain
-
-        return processor
 
     @cached_property
     def is_dynamic_tiler(self) -> bool:
@@ -461,9 +387,6 @@ class NanoNemotronVLMultiModalProcessor(
             pixel_values_flat = MultiModalFieldConfig.batched("image")
         else:
             image_num_patches = hf_inputs.get("image_num_patches", torch.empty(0))
-            # Static video-as-images uses zero patch counts for secondary frame
-            # placeholders; flat_from_sizes groups each primary frame with its
-            # temporal partner and gives secondary placeholders an empty slice.
             pixel_values_flat = MultiModalFieldConfig.flat_from_sizes(
                 "image", image_num_patches
             )
@@ -674,43 +597,6 @@ class NanoNemotronVLMultiModalProcessor(
                 tokens_per_frame = [feature_size] * num_tubelets
 
             frame_duration_ms = int(1000 / metadata["fps"])
-            use_frame_separators = _use_sft_v2_video_frame_separators()
-            if not use_frame_separators:
-                img_context_token_ids = list(hf_processor._img_context_token_ids)
-                all_token_ids: list[int] = []
-                for num_tokens in tokens_per_frame:
-                    all_token_ids.extend(hf_processor._img_start_token_ids)
-                    all_token_ids.extend(img_context_token_ids * num_tokens)
-                    all_token_ids.extend(hf_processor._img_end_token_ids)
-
-                def is_embed(tokenizer, full):
-                    token_ids = (
-                        full
-                        if isinstance(full, list)
-                        else tokenizer.encode(full, add_special_tokens=False)
-                    )
-                    return torch.isin(
-                        torch.tensor(token_ids),
-                        torch.tensor(img_context_token_ids),
-                    )
-
-                embed_token_count = sum(tokens_per_frame) * len(img_context_token_ids)
-                if os.environ.get("NRL_DEBUG", "0") == "1":
-                    print(
-                        "[VLLM_NATIVE_VIDEO_REPL_MODEL_PLAIN] "
-                        "frame_separators=0 "
-                        f"full_tokens={len(all_token_ids)} "
-                        f"embed_tokens={embed_token_count} "
-                        f"text_tokens={len(all_token_ids) - embed_token_count} "
-                        f"tubelets={len(tokens_per_frame)} T={T}",
-                        flush=True,
-                    )
-
-                return PromptUpdateDetails(
-                    full=all_token_ids,
-                    is_embed=is_embed,
-                )
-
             video_repl = hf_processor.get_video_repl(
                 tokens_per_frame=tokens_per_frame,
                 frames_indices=metadata["frames_indices"],
@@ -739,14 +625,6 @@ class NanoNemotronVLMultiModalProcessor(
                     full=video_repl.full,
                     is_embed=is_embed,
                 )
-                if os.environ.get("NRL_DEBUG", "0") == "1":
-                    print(
-                        "[VLLM_NATIVE_VIDEO_REPL_GUARD] "
-                        "added context-token embed mask "
-                        f"full_tokens={len(video_repl.full)} "
-                        f"embed_token_ids={img_context_token_ids}",
-                        flush=True,
-                    )
 
             return video_repl
 
@@ -766,38 +644,6 @@ class NanoNemotronVLMultiModalProcessor(
             audios = mm_items.get_items("audio", AudioProcessorItems)
             audio = audios.get(item_idx)
             audio_repl = hf_processor.get_audio_repl(audio)
-            if os.environ.get("NRL_DEBUG", "0") == "1":
-                extractor = getattr(hf_processor, "audio_extractor", None)
-                clip_sizes = (
-                    extractor._clip_sizes(len(audio))
-                    if extractor is not None
-                    else []
-                )
-                sampling_rate = (
-                    getattr(getattr(extractor, "config", None), "sampling_rate", None)
-                    if extractor is not None
-                    else None
-                )
-                repl_full = audio_repl.full
-                context_tokens = (
-                    repl_full.count(AUDIO_CONTEXT)
-                    if isinstance(repl_full, str)
-                    else len(repl_full)
-                )
-                duration_s = (
-                    len(audio) / float(sampling_rate) if sampling_rate else None
-                )
-                print(
-                    "[VLLM_AUDIO_REPL_MODEL] "
-                    f"item_idx={item_idx} "
-                    f"audio_len={len(audio)} "
-                    f"duration_s={duration_s} "
-                    f"sampling_rate={sampling_rate} "
-                    f"num_clips={len(clip_sizes)} "
-                    f"clip_samples={clip_sizes} "
-                    f"context_tokens={context_tokens}",
-                    flush=True,
-                )
             return audio_repl
 
         return PromptReplacement(
@@ -1394,101 +1240,6 @@ class NemotronH_Nano_VL_V2(
         pixel_values = image_input["pixel_values_flat"]
         num_patches = image_input["num_patches"]
         hidden_size = self.config.text_config.hidden_size
-        temporal_patch_size = self.video_temporal_patch_size
-
-        if (
-            temporal_patch_size > 1
-            and num_patches.numel() > 0
-            and ((num_patches == 0).any() or (num_patches == temporal_patch_size).all())
-        ):
-            if not torch.is_tensor(pixel_values):
-                flattened_pixels: list[torch.Tensor] = []
-
-                def append_pixels(item: object) -> None:
-                    if torch.is_tensor(item):
-                        if item.numel() == 0:
-                            return
-                        flattened_pixels.append(
-                            item if item.ndim == 4 else item.unsqueeze(0)
-                        )
-                        return
-                    if isinstance(item, (list, tuple)):
-                        for child in item:
-                            append_pixels(child)
-                        return
-                    raise TypeError(
-                        "Expected tensor or nested tensor list for "
-                        f"pixel_values_flat, got {type(item)}"
-                    )
-
-                append_pixels(pixel_values)
-                if not flattened_pixels:
-                    device = num_patches.device
-                    pixel_values = torch.empty(
-                        0, 3, 0, 0, device=device, dtype=torch.bfloat16
-                    )
-                else:
-                    pixel_values = torch.cat(flattened_pixels, dim=0)
-
-            total_requested_frames = int(num_patches.sum().item())
-            available_frames = int(pixel_values.shape[0])
-            if available_frames < total_requested_frames:
-                raise ValueError(
-                    "Static video-as-images received too few frame tensors for "
-                    "temporal tubelets: "
-                    f"available={available_frames}, requested={total_requested_frames}, "
-                    f"num_patches={num_patches.tolist()}. "
-                    "Check that pixel_values_flat uses flat_from_sizes with "
-                    "image_num_patches."
-                )
-
-            if os.environ.get("NRL_DEBUG", "0") == "1":
-                print(
-                    "[VLLM_VIDEO_AS_IMAGES_EMBED] "
-                    f"items={num_patches.numel()} "
-                    f"available_frames={available_frames} "
-                    f"requested_frames={total_requested_frames} "
-                    f"num_patches_head={num_patches[:8].tolist()}",
-                    flush=True,
-                )
-
-            nonzero_items = int((num_patches > 0).sum().item())
-            video_embeds = self.extract_feature(
-                pixel_values[:total_requested_frames],
-                num_frames=total_requested_frames,
-            ).view(-1, hidden_size)
-            if nonzero_items == 0:
-                feature_size = 0
-            elif video_embeds.shape[0] % nonzero_items != 0:
-                raise ValueError(
-                    "Static video-as-images produced an embedding count that "
-                    "cannot be split across temporal tubelets: "
-                    f"embeds={video_embeds.shape[0]}, items={nonzero_items}, "
-                    f"num_patches={num_patches.tolist()}"
-                )
-            else:
-                feature_size = video_embeds.shape[0] // nonzero_items
-
-            results: list[torch.Tensor] = []
-            embed_offset = 0
-            for patch_count_tensor in num_patches:
-                patch_count = int(patch_count_tensor.item())
-                if patch_count == 0:
-                    results.append(
-                        torch.empty(
-                            0,
-                            hidden_size,
-                            device=pixel_values.device,
-                            dtype=torch.bfloat16,
-                        )
-                    )
-                    continue
-
-                item_embeds = video_embeds[embed_offset : embed_offset + feature_size]
-                embed_offset += feature_size
-                results.append(item_embeds)
-
-            return tuple(results)
 
         image_embeds = self.extract_feature(pixel_values)
 
@@ -1598,63 +1349,6 @@ class NemotronH_Nano_VL_V2(
             clip_offset += num_clips
 
         return tuple(grouped_embeds)
-
-    def _create_final_video_embeddings(
-        self,
-        video_embeddings: torch.Tensor,
-        num_tokens_per_frame: list[int],
-        frames_indices: list[int],
-        frame_duration_ms: int,
-        video_temporal_patch_size: int = 1,
-    ) -> torch.Tensor:
-        """Create final embeddings that combine video embeddings with
-        text embeddings of indicator tokens.
-
-        These final embeddings contain:
-        - Actual video embeddings in positions corresponding to video content
-        - Text embeddings for indicator tokens (<img>, </img>, and
-          frame separation text) in their respective positions
-
-        These embeddings will replace the placeholder embeddings to create
-        input_embeds for the LLM.
-        """
-        tokenizer = cached_tokenizer_from_config(self.model_config)
-
-        # Generate video replacement token IDs using get_video_repl
-        # This tokenizes each frame separator independently, then uses pre-tokenized
-        # special tokens to ensure consistent tokenization regardless of
-        # num_tokens_per_frame values.
-        video_repl = NanoNemotronVLProcessor.get_video_repl(
-            tokens_per_frame=num_tokens_per_frame,
-            frames_indices=frames_indices,
-            frame_duration_ms=frame_duration_ms,
-            tokenizer=tokenizer,
-            img_start_token_ids=self._img_start_token_ids,
-            img_end_token_ids=self._img_end_token_ids,
-            img_context_token_ids=self._img_context_token_ids,
-            video_temporal_patch_size=video_temporal_patch_size,
-        )
-        device = video_embeddings.device
-
-        # video_repl.full is a list of token IDs
-        repl_token_ids = torch.tensor(video_repl.full, device=device)
-
-        # Get embedding token IDs for image context (use pre-tokenized version)
-        embed_token_ids = torch.tensor(self._img_context_token_ids, device=device)
-
-        # Create mask for video embedding positions
-        is_video_embed = torch.isin(repl_token_ids, embed_token_ids)
-
-        # Create final video embeddings, merging text embeddings for indicator
-        # tokens with video embeddings
-        text_embeddings = self.get_language_model().embed_input_ids(repl_token_ids)
-        final_video_embeddings = _merge_multimodal_embeddings(
-            inputs_embeds=text_embeddings,
-            multimodal_embeddings=video_embeddings,
-            is_multimodal=is_video_embed,
-        )
-
-        return final_video_embeddings
 
     def _parse_and_validate_video_input(
         self, **kwargs: object

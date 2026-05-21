@@ -57,7 +57,7 @@ class _VisionModel:
         self.loaded_weights = list(weights)
 
 
-class _EmptySeparatorTokenizer:
+class _SeparatorTokenizer:
     def __call__(
         self,
         texts,
@@ -67,15 +67,15 @@ class _EmptySeparatorTokenizer:
     ):
         assert add_special_tokens is False
         assert return_attention_mask is False
-        return {"input_ids": [[] for _ in texts]}
+        return {"input_ids": [[200 + idx] for idx, _ in enumerate(texts)]}
 
 
 @pytest.mark.parametrize(
     ("orig_w", "orig_h", "expected_size"),
     [
-        (480, 320, (640, 416)),
-        (640, 424, (640, 416)),
-        (1152, 720, (640, 416)),
+        (480, 320, (608, 416)),
+        (640, 424, (608, 416)),
+        (1152, 720, (640, 384)),
         (1280, 720, (672, 384)),
     ],
 )
@@ -94,26 +94,26 @@ def test_nano_nemotron_vl_video_target_size_matches_policy_processor(
     )
 
 
-def test_nano_nemotron_vl_native_video_replaces_context_tokens_only(monkeypatch):
-    monkeypatch.setenv("NRL_VLLM_VIDEO_FRAME_SEPARATORS", "0")
-
+def test_nano_nemotron_vl_native_video_replaces_context_tokens_only():
     repl = NanoNemotronVLProcessor.get_video_repl(
         tokens_per_frame=[2, 1],
         frames_indices=[0, 1, 2, 3],
         frame_duration_ms=500,
-        tokenizer=_EmptySeparatorTokenizer(),
+        tokenizer=_SeparatorTokenizer(),
         img_start_token_ids=[101],
         img_end_token_ids=[102],
         img_context_token_ids=[103],
         video_temporal_patch_size=2,
     )
 
-    assert repl.full == [101, 103, 103, 102, 101, 103, 102]
+    assert repl.full == [200, 101, 103, 103, 102, 201, 101, 103, 102]
     assert repl.is_embed is not None
     assert repl.is_embed(None, repl.full).tolist() == [
         False,
+        False,
         True,
         True,
+        False,
         False,
         False,
         True,
