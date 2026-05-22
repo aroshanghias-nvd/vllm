@@ -43,7 +43,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.evs import (
-    compute_retained_tokens_count,
+    compute_placeholder_tokens_per_frame,
     compute_retention_mask,
 )
 from vllm.multimodal.inputs import (
@@ -91,6 +91,8 @@ from vllm.transformers_utils.processors.nano_nemotron_vl import (
     get_video_target_size_and_feature_size,
 )
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+
+from .utils import _merge_multimodal_embeddings
 
 logger = init_logger(__name__)
 
@@ -176,6 +178,7 @@ class NanoNemotronVLVideoPixelInputs(TensorSchema):
     num_patches: Annotated[torch.Tensor, TensorShape("bn")]
     frames_indices: Annotated[torch.Tensor, TensorShape("bvf")]
     frame_duration_ms: Annotated[torch.Tensor, TensorShape("bn")]
+    include_text_embeddings: Annotated[torch.Tensor, TensorShape("bn")]
 
 
 class NanoNemotronVLVideoEmbeddingInputs(TensorSchema):
@@ -371,7 +374,39 @@ class NanoNemotronVLMultiModalProcessor(
         so it chooses this path:
         `type(self)._call_hf_processor != BaseMultiModalProcessor._call_hf_processor`
         """
-        return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+        hf_inputs = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+
+        video_num_patches = hf_inputs.get("video_num_patches")
+        if video_num_patches is not None:
+            num_videos = int(torch.as_tensor(video_num_patches).numel())
+            include_text = self.info.supports_audio and (
+                "audio" in mm_data or self._prompt_has_audio_context(prompt)
+            )
+            hf_inputs["video_include_text_embeddings"] = torch.full(
+                (num_videos,),
+                include_text,
+                dtype=torch.bool,
+            )
+
+        return hf_inputs
+
+    def _prompt_has_audio_context(self, prompt: str | Sequence[int]) -> bool:
+        if isinstance(prompt, str):
+            return AUDIO_CONTEXT in prompt
+
+        audio_token_ids = self.info.get_tokenizer().encode(
+            AUDIO_CONTEXT,
+            add_special_tokens=False,
+        )
+        if not audio_token_ids:
+            return False
+
+        prompt_ids = list(prompt)
+        audio_token_count = len(audio_token_ids)
+        return any(
+            prompt_ids[idx : idx + audio_token_count] == audio_token_ids
+            for idx in range(len(prompt_ids) - audio_token_count + 1)
+        )
 
     def _get_image_fields_config(self, hf_inputs: BatchFeature):
         dynamic_tiler = getattr(
@@ -409,6 +444,7 @@ class NanoNemotronVLMultiModalProcessor(
             video_num_patches=MultiModalFieldConfig.batched("video"),
             frames_indices=MultiModalFieldConfig.batched("video"),
             frame_duration_ms=MultiModalFieldConfig.batched("video"),
+            video_include_text_embeddings=MultiModalFieldConfig.batched("video"),
         )
 
     def _get_audio_fields_config(self, hf_inputs: BatchFeature):
@@ -544,6 +580,7 @@ class NanoNemotronVLMultiModalProcessor(
         hf_processor: NanoNemotronVLProcessor,
         out_mm_data: BatchedTensorInputs,
     ):
+        has_audio = self.info.supports_audio and "audio" in mm_items
         if "video_num_patches" in out_mm_data:
             video_num_patches = out_mm_data["video_num_patches"]
             assert isinstance(video_num_patches, torch.Tensor)
@@ -582,15 +619,11 @@ class NanoNemotronVLMultiModalProcessor(
             video_pruning_rate = self.info.ctx.get_mm_config().video_pruning_rate
             if video_pruning_rate is not None and video_pruning_rate > 0.0:
                 # Start of EVS-specific code
-                num_tokens = compute_retained_tokens_count(
+                tokens_per_frame = compute_placeholder_tokens_per_frame(
                     tokens_per_frame=feature_size,
                     num_frames=num_tubelets,
                     q=video_pruning_rate,
                 )
-                # Here we just need placeholders that won't actually be replaced -
-                # we just need to make sure the total number of tokens is correct
-                # assign all tokens to the first frame
-                tokens_per_frame = [num_tokens] + [0] * (num_tubelets - 1)
 
                 # End of EVS-specific code
             else:
@@ -607,6 +640,13 @@ class NanoNemotronVLMultiModalProcessor(
                 img_context_token_ids=hf_processor._img_context_token_ids,
                 video_temporal_patch_size=T,
             )
+            if (
+                has_audio
+                and video_pruning_rate is not None
+                and video_pruning_rate > 0.0
+            ):
+                return PromptUpdateDetails.from_seq(video_repl.full)
+
             if video_repl.is_embed is None:
                 img_context_token_ids = list(hf_processor._img_context_token_ids)
 
@@ -1257,7 +1297,8 @@ class NemotronH_Nano_VL_V2(
         return image_embeds.split(image_feature_sizes)
 
     def _process_video_input(
-        self, video_input: NanoNemotronVLVideoPixelInputs
+        self,
+        video_input: NanoNemotronVLVideoPixelInputs,
     ) -> tuple[torch.Tensor, ...]:
         """Process video input into embeddings for video context tokens."""
         T = self.video_temporal_patch_size
@@ -1278,8 +1319,10 @@ class NemotronH_Nano_VL_V2(
         rows = int(frame_h * downsample_ratio // patch_size)
         cols = int(frame_w * downsample_ratio // patch_size)
         video_num_frames = video_input["num_patches"].tolist()
+        include_text_embeddings = video_input["include_text_embeddings"].tolist()
 
-        pruned_video_embeddings: list[torch.Tensor] = []
+        video_frames_indices = video_input["frames_indices"].split(video_num_frames)
+        output_video_embeddings: list[torch.Tensor] = []
         for i, single_video_embeddings in enumerate(video_embeddings):
             num_frames = video_num_frames[i]
             num_tubelets = math.ceil(num_frames / T) if T > 1 else num_frames
@@ -1291,9 +1334,24 @@ class NemotronH_Nano_VL_V2(
                 spatial_merge_size=1,
                 q=video_pruning_rate,
             )
-            pruned_video_embeddings.append(single_video_embeddings[retention_mask])
+            single_video_embeddings = single_video_embeddings[retention_mask]
 
-        return tuple(pruned_video_embeddings)
+            if include_text_embeddings[i]:
+                retention_mask_thw = retention_mask.reshape(num_tubelets, rows, cols)
+                tokens_per_frame = retention_mask_thw.sum(dim=(1, 2)).long().tolist()
+                output_video_embeddings.append(
+                    self._create_final_video_embeddings(
+                        single_video_embeddings,
+                        tokens_per_frame,
+                        video_frames_indices[i].tolist(),
+                        int(video_input["frame_duration_ms"][i].item()),
+                        video_temporal_patch_size=T,
+                    )
+                )
+            else:
+                output_video_embeddings.append(single_video_embeddings)
+
+        return tuple(output_video_embeddings)
 
     def _extract_video_embeddings_temporal(
         self, video_input: NanoNemotronVLVideoPixelInputs
@@ -1350,6 +1408,37 @@ class NemotronH_Nano_VL_V2(
 
         return tuple(grouped_embeds)
 
+    def _create_final_video_embeddings(
+        self,
+        video_embeddings: torch.Tensor,
+        tokens_per_frame: list[int],
+        frames_indices: list[int],
+        frame_duration_ms: int,
+        video_temporal_patch_size: int = 1,
+    ) -> torch.Tensor:
+        tokenizer = cached_tokenizer_from_config(self.model_config)
+        video_repl = NanoNemotronVLProcessor.get_video_repl(
+            tokens_per_frame=tokens_per_frame,
+            frames_indices=frames_indices,
+            frame_duration_ms=frame_duration_ms,
+            tokenizer=tokenizer,
+            img_start_token_ids=self._img_start_token_ids,
+            img_end_token_ids=self._img_end_token_ids,
+            img_context_token_ids=self._img_context_token_ids,
+            video_temporal_patch_size=video_temporal_patch_size,
+        )
+        device = video_embeddings.device
+        repl_token_ids = torch.tensor(video_repl.full, device=device)
+        embed_token_ids = torch.tensor(self._img_context_token_ids, device=device)
+        is_video_embed = torch.isin(repl_token_ids, embed_token_ids)
+
+        text_embeddings = self.get_language_model().embed_input_ids(repl_token_ids)
+        return _merge_multimodal_embeddings(
+            inputs_embeds=text_embeddings,
+            multimodal_embeddings=video_embeddings,
+            is_multimodal=is_video_embed,
+        )
+
     def _parse_and_validate_video_input(
         self, **kwargs: object
     ) -> NanoNemotronVLVideoPixelInputs | None:
@@ -1358,6 +1447,7 @@ class NemotronH_Nano_VL_V2(
         video_embeds = kwargs.pop("video_embeds", None)
         frames_indices = kwargs.pop("frames_indices", None)
         frame_duration_ms = kwargs.pop("frame_duration_ms", None)
+        include_text_embeddings = kwargs.pop("video_include_text_embeddings", None)
 
         if pixel_values_flat_video is None and video_embeds is None:
             return None
@@ -1379,6 +1469,17 @@ class NemotronH_Nano_VL_V2(
             else:
                 frame_duration_ms = torch.cat(
                     [f.flatten() for f in frame_duration_ms], dim=0
+                )
+            if include_text_embeddings is None:
+                include_text_embeddings = torch.zeros_like(
+                    video_num_patches,
+                    dtype=torch.bool,
+                )
+            elif torch.is_tensor(include_text_embeddings):
+                include_text_embeddings = include_text_embeddings.flatten()
+            else:
+                include_text_embeddings = torch.cat(
+                    [f.flatten() for f in include_text_embeddings], dim=0
                 )
 
             if (
@@ -1404,6 +1505,7 @@ class NemotronH_Nano_VL_V2(
                 num_patches=video_num_patches,
                 frames_indices=frames_indices,
                 frame_duration_ms=frame_duration_ms,
+                include_text_embeddings=include_text_embeddings,
                 resolve_bindings=resolve_bindings,
             )
 

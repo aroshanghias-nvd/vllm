@@ -23,7 +23,7 @@ from PIL import Image
 from transformers import BatchFeature, PretrainedConfig, TensorType
 
 from vllm.model_executor.models.parakeet import ParakeetExtractor
-from vllm.multimodal.evs import compute_retained_tokens_count
+from vllm.multimodal.evs import compute_placeholder_tokens_per_frame
 from vllm.multimodal.inputs import AudioItem
 from vllm.multimodal.processing.processor import PromptUpdateDetails
 from vllm.tokenizers.hf import HfTokenizer
@@ -691,7 +691,11 @@ class BaseNanoNemotronVLProcessor(ABC):
             return text, {}
 
         image_inputs: dict[str, Any]
-        tiler = None if max_num_tiles is not None else self.dynamic_tiler
+        # Preserve the dynamic-resolution image path when callers pass the
+        # standard image tile cap.  The eval wrapper sends max_num_tiles for
+        # image datasets, while max_num_tiles=1 is still used to force the
+        # static one-tile frame path for video-as-images.
+        tiler = None if max_num_tiles == 1 else self.dynamic_tiler
         if tiler:
             sans_images = text[0].replace("<image>", "")
             text_prompt_length = len(
@@ -992,16 +996,11 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
 
             if self.video_pruning_rate is not None and self.video_pruning_rate > 0.0:
                 # Start of EVS-specific code
-                num_tokens = compute_retained_tokens_count(
+                tokens_per_frame = compute_placeholder_tokens_per_frame(
                     tokens_per_frame=tokens_in_single_frame,
                     num_frames=num_tubelets,
                     q=self.video_pruning_rate,
                 )
-
-                # Here we just need placeholders that won't actually be replaced -
-                # we just need to make sure the total number of tokens is correct
-                # assign all tokens to the first frame
-                tokens_per_frame = [num_tokens] + [0] * (num_tubelets - 1)
 
                 # End of EVS-specific code
             else:
@@ -1161,12 +1160,15 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         The replacement expands the `<video>` placeholder into frame separator
         text plus image-wrapper tokens. Only image context tokens are marked as
         embedding positions; wrapper/separator tokens stay text tokens.
-        This is a single function that handles all cases - non EVS, EVS dummy, EVS real.
+        This is a single function that handles non-EVS and EVS placeholder
+        expansion.
         The differentiation is done via tokens_per_frame parameter.
         - non EVS case - constant value same value across all frames
-        - EVS dummy - Doesn't matter how tokens are distributed between frames - just
-                        make sure the total number of tokens is correct.
-        - EVS real (called from get_real_video_repl_for_evs) - different value per frame
+        - EVS case - retained-token count can vary per frame. This still
+                     happens before the embedding-dependent EVS mask is known,
+                     but frame separators are text tokens, so the distribution
+                     should approximate retained temporal coverage instead of
+                     placing every retained placeholder under the first frame.
         Args:
             tokens_per_frame (list[int]): number of tokens per frame
                 (one per tubelet when T > 1)
