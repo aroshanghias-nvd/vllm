@@ -35,6 +35,48 @@ def compute_retained_tokens_count(
     return max(min_num_tokens, evs_num_tokens)
 
 
+def compute_placeholder_tokens_per_frame(
+    tokens_per_frame: int,
+    num_frames: int,
+    q: float,
+) -> list[int]:
+    """
+    Approximate the per-frame retained-token layout for placeholder expansion.
+
+    The real EVS mask is embedding-dependent and is only known after vision
+    encoding. Placeholder expansion happens earlier, but SFT-v2 video prompts
+    interleave frame text with image-context tokens, so assigning every retained
+    placeholder to the first frame misplaces later retained embeddings under the
+    first frame label.
+
+    This deterministic layout preserves EVS's first-frame guarantee and spreads
+    the remaining retained token budget over later frames while keeping the same
+    total placeholder count as compute_retained_tokens_count.
+    """
+    if num_frames <= 0:
+        return []
+
+    retained_tokens = compute_retained_tokens_count(
+        tokens_per_frame=tokens_per_frame,
+        num_frames=num_frames,
+        q=q,
+    )
+    if num_frames == 1:
+        return [retained_tokens]
+
+    first_frame_tokens = min(tokens_per_frame, retained_tokens)
+    remaining_tokens = retained_tokens - first_frame_tokens
+    base, extra = divmod(remaining_tokens, num_frames - 1)
+
+    return [
+        first_frame_tokens,
+        *[
+            min(tokens_per_frame, base + (1 if frame_idx < extra else 0))
+            for frame_idx in range(num_frames - 1)
+        ],
+    ]
+
+
 def compute_retention_mask(
     video_embeds: torch.Tensor,
     video_size_thw: torch.LongTensor | tuple[int, int, int],

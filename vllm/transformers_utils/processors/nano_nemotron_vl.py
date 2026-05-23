@@ -23,7 +23,7 @@ from PIL import Image
 from transformers import BatchFeature, PretrainedConfig, TensorType
 
 from vllm.model_executor.models.parakeet import ParakeetExtractor
-from vllm.multimodal.evs import compute_retained_tokens_count
+from vllm.multimodal.evs import compute_placeholder_tokens_per_frame
 from vllm.multimodal.inputs import AudioItem
 from vllm.multimodal.processing.processor import PromptUpdateDetails
 from vllm.tokenizers.hf import HfTokenizer
@@ -682,23 +682,64 @@ class BaseNanoNemotronVLProcessor(ABC):
         self,
         text: list[str],
         images: list[Image.Image],
-        max_num_tiles: int,
+        max_num_tiles: int | None,
+        use_fast_preprocessing: bool | None = None,
+        max_num_patches: int | None = None,
+        precomputed_imgs_sizes: list[list[int]] | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         if len(images) == 0:
             return text, {}
 
         image_inputs: dict[str, Any]
-        if tiler := self.dynamic_tiler:
+        # Preserve the dynamic-resolution image path when callers pass the
+        # standard image tile cap.  The eval wrapper sends max_num_tiles for
+        # image datasets, while max_num_tiles=1 is still used to force the
+        # static one-tile frame path for video-as-images.
+        tiler = None if max_num_tiles == 1 else self.dynamic_tiler
+        if tiler:
             sans_images = text[0].replace("<image>", "")
             text_prompt_length = len(
                 self.tokenizer(sans_images, add_special_tokens=False).input_ids
             )
-            pixel_values_lst, num_tokens_per_image = tiler._images_to_pixel_values_lst(
-                text_prompt_length=text_prompt_length,
-                images=images,
-                dtype=self.dtype,
-            )
-            imgs_sizes = [(pv.shape[-2], pv.shape[-1]) for pv in pixel_values_lst]
+            if precomputed_imgs_sizes is not None and len(precomputed_imgs_sizes) == len(
+                images
+            ):
+                pixel_values_lst = []
+                num_tokens_per_image = []
+                imgs_sizes = []
+                for image, (target_h, target_w) in zip(
+                    images, precomputed_imgs_sizes, strict=True
+                ):
+                    target_h, target_w = int(target_h), int(target_w)
+                    resized = _bicubic_resize_and_normalize(
+                        _pil_to_nhwc_tensor(image),
+                        size=(target_h, target_w),
+                        norm_mean=self.norm_mean,
+                        norm_std=self.norm_std,
+                        dtype=self.dtype,
+                    )
+                    pixel_values_lst.extend(list(resized))
+                    imgs_sizes.append((target_h, target_w))
+                    num_tokens_per_image.append(
+                        tiler._get_num_embeddings(target_w, target_h)
+                    )
+            else:
+                old_max_num_patches = tiler._max_num_patches
+                if max_num_patches is not None:
+                    tiler._max_num_patches = (
+                        max_num_patches if max_num_patches > 0 else float("inf")
+                    )
+                try:
+                    pixel_values_lst, num_tokens_per_image = (
+                        tiler._images_to_pixel_values_lst(
+                            text_prompt_length=text_prompt_length,
+                            images=images,
+                            dtype=self.dtype,
+                        )
+                    )
+                finally:
+                    tiler._max_num_patches = old_max_num_patches
+                imgs_sizes = [(pv.shape[-2], pv.shape[-1]) for pv in pixel_values_lst]
             image_num_patches = torch.tensor([1] * len(num_tokens_per_image))
             image_inputs = {
                 "pixel_values_flat": pixel_values_lst,
@@ -706,6 +747,7 @@ class BaseNanoNemotronVLProcessor(ABC):
                 "num_tokens_per_image": num_tokens_per_image,
             }
         else:
+            max_num_tiles = max_num_tiles or self.max_num_tiles
             pixel_values_lst = self._images_to_pixel_values_lst(images, max_num_tiles)
             image_num_patches = torch.tensor([len(item) for item in pixel_values_lst])
             pixel_values_flat = (
@@ -731,11 +773,15 @@ class BaseNanoNemotronVLProcessor(ABC):
             f"but found {parts.count('<image>')}"
         )
 
-        for i, (feature_size, num_patches) in enumerate(
-            zip(num_tokens_per_image, image_num_patches, strict=True)
-        ):
+        image_idx = 0
+        for part_idx, part in enumerate(parts):
+            if part != "<image>":
+                continue
+            feature_size = num_tokens_per_image[image_idx]
+            num_patches = image_num_patches[image_idx]
             image_repl = self.get_image_repl(feature_size, num_patches)
-            parts[i] = parts[i].replace("<image>", image_repl.full)
+            parts[part_idx] = image_repl.full
+            image_idx += 1
         text = ["".join(parts)]
 
         return text, image_inputs
@@ -777,6 +823,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         video_token: str | None = None,
         video_pruning_rate: float | None = None,
         use_audio_in_video: bool = False,
+        **kwargs: object,
     ) -> None:
         super().__init__(
             config=config,
@@ -949,16 +996,11 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
 
             if self.video_pruning_rate is not None and self.video_pruning_rate > 0.0:
                 # Start of EVS-specific code
-                num_tokens = compute_retained_tokens_count(
+                tokens_per_frame = compute_placeholder_tokens_per_frame(
                     tokens_per_frame=tokens_in_single_frame,
                     num_frames=num_tubelets,
                     q=self.video_pruning_rate,
                 )
-
-                # Here we just need placeholders that won't actually be replaced -
-                # we just need to make sure the total number of tokens is correct
-                # assign all tokens to the first frame
-                tokens_per_frame = [num_tokens] + [0] * (num_tubelets - 1)
 
                 # End of EVS-specific code
             else:
@@ -1023,12 +1065,11 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         *,
         return_tensors: str | TensorType | None = None,
         max_num_tiles: int | None = None,
+        use_fast_preprocessing: bool | None = None,
+        max_num_patches: int | None = None,
+        precomputed_imgs_sizes: list[list[int]] | None = None,
         **kwargs,
     ) -> BatchFeature:
-        # Use default if not provided
-        if max_num_tiles is None:
-            max_num_tiles = self.max_num_tiles
-
         text = self._make_batch_input(text)
         images = self._make_batch_input(images)
         videos = self._make_batch_input(videos)
@@ -1038,6 +1079,9 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             text=text,
             images=images,
             max_num_tiles=max_num_tiles,
+            use_fast_preprocessing=use_fast_preprocessing,
+            max_num_patches=max_num_patches,
+            precomputed_imgs_sizes=precomputed_imgs_sizes,
         )
 
         text, video_inputs = self._preprocess_video(
@@ -1113,20 +1157,18 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
     ) -> PromptUpdateDetails[list[int]]:
         """
         Build prompt replacement for a video.
-        The replacement returned is not actually used to replace the placeholder
-        tokens - it's just used to make sure we allocate the correct number
-        of tokens.
-        Actual replacement is done in embed_multimodal of
-        NemotronH_Nano_VL_V2
-        (specifically in _process_video_input -> _create_final_video_embeddings).
-        There, we create the final embeddings with text embeddings for indicator tokens
-        and video embeddings for video tokens.
-        This is a single function that handles all cases - non EVS, EVS dummy, EVS real.
+        The replacement expands the `<video>` placeholder into frame separator
+        text plus image-wrapper tokens. Only image context tokens are marked as
+        embedding positions; wrapper/separator tokens stay text tokens.
+        This is a single function that handles non-EVS and EVS placeholder
+        expansion.
         The differentiation is done via tokens_per_frame parameter.
         - non EVS case - constant value same value across all frames
-        - EVS dummy - Doesn't matter how tokens are distributed between frames - just
-                        make sure the total number of tokens is correct.
-        - EVS real (called from get_real_video_repl_for_evs) - different value per frame
+        - EVS case - retained-token count can vary per frame. This still
+                     happens before the embedding-dependent EVS mask is known,
+                     but frame separators are text tokens, so the distribution
+                     should approximate retained temporal coverage instead of
+                     placing every retained placeholder under the first frame.
         Args:
             tokens_per_frame (list[int]): number of tokens per frame
                 (one per tubelet when T > 1)
@@ -1204,4 +1246,6 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             all_token_ids.extend(img_context_token_ids * num_tokens)
             all_token_ids.extend(img_end_token_ids)
 
-        return PromptUpdateDetails.from_seq(all_token_ids)
+        return PromptUpdateDetails.select_token_ids(
+            all_token_ids, img_context_token_ids
+        )
