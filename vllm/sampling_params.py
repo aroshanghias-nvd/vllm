@@ -4,6 +4,7 @@
 
 import copy
 import json as json_mod
+import threading
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
@@ -24,6 +25,16 @@ logger = init_logger(__name__)
 
 _SAMPLING_EPS = 1e-5
 _MAX_TEMP = 1e-2
+
+# Cache of tokenized bad_words, keyed by (id(tokenizer), bad_words tuple).
+# bad_words arrive as strings and were re-tokenized on EVERY request; the HF
+# fast tokenizer is not thread-safe, so concurrent requests carrying the same
+# bad_words raced in tokenizer.encode ("RuntimeError: Already borrowed", and
+# worse). One cached tokenization per distinct bad_words list fixes both the
+# race and the per-request cost. The lock only serializes first-compute.
+_BAD_WORDS_TOKEN_IDS_CACHE: dict[tuple[int, tuple[str, ...]], list[list[int]]] = {}
+_BAD_WORDS_TOKEN_IDS_CACHE_LOCK = threading.Lock()
+_BAD_WORDS_TOKEN_IDS_CACHE_MAX_ENTRIES = 1024
 
 MAX_LOGPROB_TOKEN_IDS = 128
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
@@ -573,7 +584,26 @@ class SamplingParams(
     def update_from_tokenizer(self, tokenizer: TokenizerLike) -> None:
         if not self.bad_words:
             return
-        self._bad_words_token_ids = []
+        cache_key = (id(tokenizer), tuple(self.bad_words))
+        cached = _BAD_WORDS_TOKEN_IDS_CACHE.get(cache_key)
+        if cached is not None:
+            self._bad_words_token_ids = cached
+            return
+        with _BAD_WORDS_TOKEN_IDS_CACHE_LOCK:
+            cached = _BAD_WORDS_TOKEN_IDS_CACHE.get(cache_key)
+            if cached is not None:
+                self._bad_words_token_ids = cached
+                return
+            self._bad_words_token_ids = self._tokenize_bad_words(tokenizer)
+            if (
+                len(_BAD_WORDS_TOKEN_IDS_CACHE)
+                >= _BAD_WORDS_TOKEN_IDS_CACHE_MAX_ENTRIES
+            ):
+                _BAD_WORDS_TOKEN_IDS_CACHE.clear()
+            _BAD_WORDS_TOKEN_IDS_CACHE[cache_key] = self._bad_words_token_ids
+
+    def _tokenize_bad_words(self, tokenizer: TokenizerLike) -> list[list[int]]:
+        bad_words_token_ids: list[list[int]] = []
         for bad_word in self.bad_words:
             # To prohibit words both at the beginning
             # and in the middle of text
@@ -589,15 +619,15 @@ class SamplingParams(
                 # or if prefix space produces a new word token
                 if (not add_prefix_space) or (
                     add_prefix_space
-                    and prompt_token_ids[0] != self._bad_words_token_ids[-1][0]
-                    and len(prompt_token_ids) == len(self._bad_words_token_ids[-1])
+                    and prompt_token_ids[0] != bad_words_token_ids[-1][0]
+                    and len(prompt_token_ids) == len(bad_words_token_ids[-1])
                 ):
-                    self._bad_words_token_ids.append(prompt_token_ids)
+                    bad_words_token_ids.append(prompt_token_ids)
 
         invalid_token_ids = [
             token_id
-            for bad_words_token_ids in self._bad_words_token_ids
-            for token_id in bad_words_token_ids
+            for token_ids in bad_words_token_ids
+            for token_id in token_ids
             if token_id < 0 or token_id > tokenizer.max_token_id
         ]
         if len(invalid_token_ids) > 0:
@@ -610,6 +640,7 @@ class SamplingParams(
                 parameter="bad_words",
                 value=self.bad_words,
             )
+        return bad_words_token_ids
 
     @cached_property
     def sampling_type(self) -> SamplingType:
